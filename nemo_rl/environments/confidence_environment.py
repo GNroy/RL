@@ -279,7 +279,7 @@ class VerifyCenteredConfidenceWorker:
             confidence_analysis = re.search(r'<analysis>(.+)</analysis>', response, re.DOTALL)
             no_confidence_analysis = confidence_analysis is None
             if confidence_analysis:
-                if len(confidence_analysis) != 1:
+                if len(confidence_analysis.groups()) != 1:
                     no_confidence_analysis = True
                 else:
                     confidence_analysis = "\n" + confidence_analysis.group(1).strip()
