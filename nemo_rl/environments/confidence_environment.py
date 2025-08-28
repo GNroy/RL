@@ -14,7 +14,7 @@ from nemo_rl.environments.math_environment import _mute_output
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
-class ConfidenceEnvConfig(TypedDict):
+class BinaryConfidenceEnvConfig(TypedDict):
     num_workers: int
     verifier_type: Optional[str]
     # Optional reward configuration
@@ -25,8 +25,22 @@ class ConfidenceEnvConfig(TypedDict):
     reward_no_confidence: Optional[float]
 
 
+class CenteredConfidenceEnvConfig(TypedDict):
+    num_workers: int
+    verifier_type: Optional[str]
+    # Optional reward configuration
+    reward_correct_positive: Optional[float]
+    reward_correct_negative: Optional[float]
+    reward_incorrect_negative: Optional[float]
+    reward_incorrect_positive: Optional[float]
+    reward_no_confidence: Optional[float]
+    reward_analysis_consistent: Optional[float]
+    reward_no_analysis: Optional[float]
+    reward_diversity_bonus: Optional[float]
+
+
 @ray.remote  # pragma: no cover
-class VerifyConfidenceWorker:
+class VerifyBinaryConfidenceWorker:
     def __init__(self, reward_scheme: dict):
         self.reward_correct_high = reward_scheme["reward_correct_high"]
         self.reward_correct_low = reward_scheme["reward_correct_low"]
@@ -203,13 +217,205 @@ class VerifyConfidenceWorker:
             return results
 
 
+@ray.remote  # pragma: no cover
+class VerifyCenteredConfidenceWorker:
+    def __init__(self, reward_scheme: dict):
+        self.reward_correct_positive = reward_scheme["reward_correct_positive"]
+        self.reward_correct_negative = reward_scheme["reward_correct_negative"]
+        self.reward_incorrect_negative = reward_scheme["reward_incorrect_negative"]
+        self.reward_incorrect_positive = reward_scheme["reward_incorrect_positive"]
+        self.reward_no_confidence = reward_scheme["reward_no_confidence"]
+        self.reward_analysis_consistent = reward_scheme["reward_analysis_consistent"]
+        self.reward_no_analysis = reward_scheme["reward_no_analysis"]
+        self.reward_diversity_bonus = reward_scheme["reward_diversity_bonus"]
+
+        # Initialize the math verification function
+        self.verify_func = math_metric(
+            gold_extraction_target=(LatexExtractionConfig(),),
+            pred_extraction_target=(
+                ExprExtractionConfig(),
+                LatexExtractionConfig(),
+            ),
+        )
+
+    def parse_confidence_level(self, response: str) -> float:
+        """Returns positive int for number of '+' in confidence minus negative int for number of '-'.
+        Returns -10.0 if no valid confidence line is found.
+        """
+        confidence_matches = re.findall(
+            r"(?m)^\s*Confidence:\s*([\+\-]+|0)\s*$", response
+        )
+        if confidence_matches:
+            confidence_text = confidence_matches[-1]
+            return confidence_text.count("+") - confidence_text.count("-")
+        else:
+            return -10.0
+
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+    ) -> Union[list[float], tuple[list[float], list[dict[str, str]]]]:
+        results: list[float] = []
+        extracted_answers: list[dict[str, str]] = []
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            is_correct = False
+            last_think_token = re.search(r"</think>", response)
+            if last_think_token:
+                response = response[
+                    last_think_token.start() + len("</think>") :
+                ]  # We do not care what's inside of <think> </think>
+            else:
+                results.append(
+                    self.reward_no_confidence + self.reward_no_analysis
+                )  # No think token, assumes model didn't finish thinking or follow format
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            # Extract confidence analysis
+            # Each analysis point appears after new line and optional whitespace,
+            # then +, ++, - or --, then at least one space
+            confidence_analysis = re.search(r'<analysis>(.+)</analysis>', response, re.DOTALL)
+            no_confidence_analysis = confidence_analysis is None
+            if confidence_analysis:
+                if len(confidence_analysis) != 1:
+                    no_confidence_analysis = True
+                else:
+                    confidence_analysis = "\n" + confidence_analysis.group(1).strip()
+                    signs_in_analysis_match = re.findall(r'\n\s*(\+|\-|\+\+|\-\-)\s+', confidence_analysis)
+                    signs_in_analysis = "0"
+                    if len(signs_in_analysis_match) != 0:
+                        signs_in_analysis = "".join(signs_in_analysis_match)
+
+            # Enforce STRICT final-output format:
+            # - Exactly one line 'Answer: \\boxed{...}' (line-anchored)
+            # - Exactly one line 'Confidence: +|-|++|--|+-|...' (line-anchored)
+            # - Confidence appears AFTER Answer
+            # - Nothing except whitespace is present after the Confidence line
+            fallback_reward = self.reward_no_confidence + (
+                self.reward_no_analysis if no_confidence_analysis else 0.0
+            )
+
+            # 1) Answer line occurrences must be exactly one
+            answer_iters = list(
+                re.finditer(r"(?m)^\s*Answer:\s*\\boxed{([^}]*)}\s*$", response)
+            )
+            if len(answer_iters) != 1:
+                results.append(fallback_reward)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+            parseble_response = f"\\boxed{{{answer_iters[0].group(1)}}}"
+
+            # 2) Confidence line occurrences must be exactly one
+            confidence_iters = list(
+                re.finditer(r"(?m)^\s*Confidence:\s*([\+\-]+|0)\s*$", response)
+            )
+            if len(confidence_iters) != 1:
+                results.append(fallback_reward)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            # 3) Confidence must come after Answer
+            if confidence_iters[0].start() < answer_iters[0].end():
+                results.append(fallback_reward)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            # 4) Only whitespace allowed after the Confidence line
+            if response[confidence_iters[0].end() :].strip() != "":
+                results.append(fallback_reward)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            confidence_text = confidence_iters[0].group(1)
+            with _mute_output():
+                try:
+                    # Wrap ground truth in \boxed{} format for math verification
+                    ground_truth_boxed = f"\\boxed{{{ground_truth}}}"
+                    ret_score, extracted_answer_result = self.verify_func(
+                        [ground_truth_boxed], [parseble_response]
+                    )
+                    is_correct = float(ret_score) == 1.0
+
+                    # Extract both mathematical answer and confidence
+                    mathematical_answer = ""
+                    confidence = confidence_text
+
+                    # Extract mathematical answer similar to math environment logic
+                    if return_extracted_answer and extracted_answer_result is not None:
+                        assert len(extracted_answer_result) == 2
+                        extracted_gold, extracted_prediction = extracted_answer_result
+                        # Get the extracted answer with the same logic as in the HFVerifyWorker
+                        answer_found = None
+                        for pred in extracted_prediction:
+                            if any(
+                                grader.verify(gold, pred) for gold in extracted_gold
+                            ):
+                                answer_found = pred
+                                break
+                        if answer_found is None and extracted_prediction:
+                            # If no match is found, means all answers are incorrect, just use the first prediction
+                            answer_found = (
+                                extracted_prediction[0][0]
+                                if extracted_prediction[0]
+                                else None
+                            )
+                        mathematical_answer = (
+                            answer_found if answer_found is not None else ""
+                        )
+
+                    extracted_answers.append(
+                        {
+                            "mathematical_answer": mathematical_answer,
+                            "confidence": confidence,
+                        }
+                    )
+
+                except Exception as e:
+                    is_correct = False  # Error in verification, assumes model didn't follow format
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
+            # Use strictly parsed confidence line to determine level
+            confidence_level = confidence_text.count("+") - confidence_text.count("-")
+            confidence_level_diversity = len(set(confidence_text))  # 1 if all + or all -, 2 if mixed
+            final_reward = 0.0
+            if no_confidence_analysis:
+                final_reward += self.reward_no_analysis
+            elif confidence_text == signs_in_analysis:
+                final_reward += self.reward_analysis_consistent
+            if confidence_level_diversity == 2:
+                final_reward += self.reward_diversity_bonus
+            if is_correct:
+                if confidence_level > 0:
+                    final_reward += self.reward_correct_positive
+                elif confidence_level < 0:
+                    final_reward += self.reward_correct_negative
+                else: # confidence_level == 0
+                    final_reward += (self.reward_correct_positive + self.reward_correct_negative) / 2
+            else:
+                if confidence_level > 0:
+                    final_reward += self.reward_incorrect_positive
+                elif confidence_level < 0:
+                    final_reward += self.reward_incorrect_negative
+                else: # confidence_level == 0
+                    final_reward += (self.reward_incorrect_positive + self.reward_incorrect_negative) / 2
+            results.append(final_reward)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class ConfidenceEnvironment(EnvironmentInterface):
-    def __init__(self, cfg: ConfidenceEnvConfig):
+class BinaryConfidenceEnvironment(EnvironmentInterface):
+    def __init__(self, cfg: BinaryConfidenceEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
         worker_cls = {
-            "confidence_verify": VerifyConfidenceWorker,
+            "confidence_verify": VerifyBinaryConfidenceWorker,
         }[cfg.get("verifier_type", "confidence_verify")]
 
         self.reward_scheme = {
@@ -373,6 +579,181 @@ class ConfidenceEnvironment(EnvironmentInterface):
             .item(),
             "no_confidence_fraction": (
                 rewards == self.reward_scheme["reward_no_confidence"]
+            )
+            .float()
+            .mean()
+            .item(),
+            "num_samples": num_samples,
+        }
+
+        # Add generation length metrics if available
+        if "generation_lengths" in batch:
+            metrics["mean_generation_length"] = (
+                batch["generation_lengths"].float().mean().item()
+            )
+
+        return batch, metrics
+
+    def shutdown(self) -> None:
+        """Clean up all workers."""
+        for worker in self.workers:
+            ray.kill(worker)
+
+
+@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+class CenteredConfidenceEnvironment(EnvironmentInterface):
+    def __init__(self, cfg: CenteredConfidenceEnvConfig):
+        self.cfg = cfg
+        self.num_workers = cfg["num_workers"]
+        worker_cls = {
+            "confidence_verify": VerifyCenteredConfidenceWorker,
+        }[cfg.get("verifier_type", "confidence_verify")]
+
+        self.reward_scheme = {
+            "reward_correct_positive": cfg.get("reward_correct_positive", 8.0),
+            "reward_correct_negative": cfg.get("reward_correct_negative", 4.0),
+            "reward_incorrect_negative": cfg.get("reward_incorrect_negative", 0.0),
+            "reward_incorrect_positive": cfg.get("reward_incorrect_positive", -4.0),
+            "reward_no_confidence": cfg.get("reward_no_confidence", -8.0),
+            "reward_analysis_consistent": cfg.get("reward_analysis_consistent", 1.0),
+            "reward_no_analysis": cfg.get("reward_no_analysis", -2.0),
+            "reward_diversity_bonus": cfg.get("reward_diversity_bonus", 0.5),
+        }
+
+        self.workers = [
+            worker_cls.options(  # type: ignore # (decorated with @ray.remote)
+                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+            ).remote(self.reward_scheme)  # Pass config to worker
+            for _ in range(self.num_workers)
+        ]
+
+    def step(
+        self,
+        message_log_batch: list[list[dict[str, str]]],
+        metadata: list[dict],
+        return_extracted_answer: bool = False,
+    ) -> EnvironmentReturn:
+        assistant_response_batch = []
+        for conversation in message_log_batch:
+            assistant_responses = [
+                interaction["content"]
+                for interaction in conversation
+                if interaction["role"] == "assistant"
+            ]
+            assistant_response_batch.append("".join(assistant_responses))
+
+        ground_truths = [g["ground_truth"] for g in metadata]
+
+        chunked_assistant_response_batch = chunk_list_to_workers(
+            assistant_response_batch, self.num_workers
+        )
+        chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
+        futures = [
+            self.workers[i].verify.remote(
+                chunk, ground_truth_chunk, return_extracted_answer
+            )
+            for i, (chunk, ground_truth_chunk) in enumerate(
+                zip(chunked_assistant_response_batch, chunked_ground_truths)
+            )
+        ]
+        worker_results = ray.get(futures)
+
+        # Flatten the results and extract both scores and answers
+        results = []
+        extracted_answers: list[dict[str, str]] | None = (
+            [] if return_extracted_answer else None
+        )
+
+        for worker_result in worker_results:
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                results.extend(worker_scores)
+                extracted_answers.extend(worker_answers)
+            else:
+                results.extend(worker_result)
+        observations = [
+            {
+                "role": "environment",
+                "content": f"Environment: Task completed. Reward={result:.2f}",
+            }
+            for result in results
+        ]
+        rewards = torch.tensor(results).cpu()
+        terminateds = torch.ones_like(rewards).cpu()
+        next_stop_strings = [None] * len(message_log_batch)
+        return EnvironmentReturn(
+            observations=observations,
+            metadata=metadata,
+            next_stop_strings=next_stop_strings,
+            rewards=rewards,
+            terminateds=terminateds,
+            answers=extracted_answers,
+        )
+
+    def global_post_process_and_metrics(
+        self, batch: BatchedDataDict
+    ) -> tuple[BatchedDataDict, dict]:
+        """Post-process batch and compute confidence metrics."""
+        rewards = batch["rewards"]
+        num_samples = len(rewards)
+
+        # Count different reward categories
+        correct_threshold = self.reward_scheme["reward_correct_negative"] - self.reward_scheme["reward_no_analysis"]
+        correct_positive_threshold = self.reward_scheme["reward_correct_positive"] - self.reward_scheme["reward_no_analysis"]
+        incorrect_threshold = self.reward_scheme["reward_incorrect_positive"] - self.reward_scheme["reward_no_analysis"]
+        incorrect_negative_threshold = self.reward_scheme["reward_incorrect_negative"] - self.reward_scheme["reward_no_analysis"]
+        overall_correct = (rewards >= correct_threshold).sum().item()
+        overall_incorrect = (incorrect_threshold <= rewards < correct_threshold).sum().item()
+
+        # Calculate accuracies with safety checks
+        completed = overall_correct + overall_incorrect
+        completed_accuracy = overall_correct / completed if completed > 0 else 0.0
+        overall_accuracy = overall_correct / num_samples if num_samples > 0 else 0.0
+
+        # Calculate mean reward
+        mean_reward = rewards.mean().item() if num_samples > 0 else 0.0
+
+        # Calculate NCA (Normalized Confidence Advantage)
+        inadequate_confidence = (
+            correct_threshold <= rewards < correct_positive_threshold
+        ).sum().item() + (rewards < incorrect_negative_threshold).sum().item()
+
+        # Use valid samples only for normalization coefficient
+        norm_coef = min(overall_correct, num_samples - overall_correct)
+        nca = 1.0 - (inadequate_confidence / norm_coef) if norm_coef > 0 else 0.0
+
+        # Calculate fractions
+        metrics = {
+            "completed_accuracy": completed_accuracy,
+            "overall_accuracy": overall_accuracy,
+            "mean_reward": mean_reward,
+            "normalized_confidence_advantage": nca,
+            "correct_confident_fraction": (
+                rewards >= correct_positive_threshold
+            )
+            .float()
+            .mean()
+            .item(),
+            "incorrect_confident_fraction": (
+                incorrect_threshold <= rewards < incorrect_negative_threshold
+            )
+            .float()
+            .mean()
+            .item(),
+            "correct_unconfident_fraction": (
+                correct_threshold <= rewards < correct_positive_threshold
+            )
+            .float()
+            .mean()
+            .item(),
+            "incorrect_unconfident_fraction": (
+                incorrect_negative_threshold <= rewards < correct_threshold
+            )
+            .float()
+            .mean()
+            .item(),
+            "no_confidence_fraction": (
+                rewards < incorrect_threshold
             )
             .float()
             .mean()
